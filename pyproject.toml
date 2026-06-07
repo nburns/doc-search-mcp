@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doc-search-mcp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]",
+    "pymupdf",
+    "ebooklib",
+    "beautifulsoup4",
+    "tiktoken",
+    "fastembed",
+    "sqlite-vec",
+    "sentence-transformers",
+    "asyncpg",
+    "uvicorn",
+    "starlette",
+    "tomli; python_version < '3.11'",
+]
+
+[project.scripts]
+doc-search-mcp = "doc_search_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/doc_search_mcp"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "pyright>=1.1",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+include = ["src"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
