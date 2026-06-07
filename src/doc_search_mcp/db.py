@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 # Data records
 # ---------------------------------------------------------------------------
 
-_PATH_SEP = "\x00"  # null byte - cannot appear in file paths
+_PATH_SEP = "\x1f"  # ASCII unit separator - cannot appear in file paths
 
 
 @dataclass
