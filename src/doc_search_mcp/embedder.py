@@ -81,22 +81,19 @@ def _make_ollama(model: str, url: str):
     class _OllamaEmbedder:
         def __init__(self, model: str, url: str) -> None:
             self._model = model
-            self._url = url.rstrip("/") + "/api/embeddings"
+            self._url = url.rstrip("/") + "/api/embed"
 
         def embed(self, texts: list[str]):
-            vectors = []
-            for text in texts:
-                payload = json.dumps({"model": self._model, "prompt": text}).encode()
-                req = urllib.request.Request(
-                    self._url,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"Ollama embedding failed: HTTP {resp.status}")
-                    data = json.loads(resp.read())
-                vectors.append(data["embedding"])
-            return np.array(vectors, dtype=np.float32)
+            payload = json.dumps({"model": self._model, "input": texts}).encode()
+            req = urllib.request.Request(
+                self._url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Ollama embedding failed: HTTP {resp.status}")
+                data = json.loads(resp.read())
+            return np.array(data["embeddings"], dtype=np.float32)
 
     return _OllamaEmbedder(model, url)

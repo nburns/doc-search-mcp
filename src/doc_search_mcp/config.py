@@ -30,7 +30,7 @@ class StorageConfig:
 @dataclass
 class EmbeddingsConfig:
     backend: str = "auto"
-    model: str = "nomic-embed-text"
+    model: str = "nomic-ai/nomic-embed-text-v1.5"
     ollama_url: str = "http://localhost:11434"
 
 
