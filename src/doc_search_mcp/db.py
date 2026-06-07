@@ -12,10 +12,13 @@ from typing import Protocol, runtime_checkable
 # Data records
 # ---------------------------------------------------------------------------
 
+_PATH_SEP = "|||"  # unlikely to appear in file paths; safe in SQL strings
+
 
 @dataclass
 class DocumentRecord:
-    path: str
+    # paths is a list: same content at multiple locations shares one record
+    paths: list[str]
     title: str
     file_type: str  # pdf | epub | txt | md
     category: str
@@ -25,6 +28,10 @@ class DocumentRecord:
     chunk_count: int = 0
     id: int | None = None
     indexed_at: datetime | None = None
+
+    @property
+    def primary_path(self) -> str:
+        return self.paths[0] if self.paths else ""
 
 
 @dataclass
@@ -99,7 +106,14 @@ class SearchBackend(Protocol):
     async def init_schema(self) -> None: ...
 
     async def upsert_document(self, doc: DocumentRecord) -> int:
-        """Insert or update a document record. Returns the document id."""
+        """Insert or update a document record, deduplicating by (checksum, category).
+        Adds doc.paths to document_paths. Returns the document id."""
+        ...
+
+    async def add_path(self, document_id: int, path: str) -> None: ...
+
+    async def remove_path(self, path: str, category: str) -> bool:
+        """Remove a path. Deletes the document if it was the last path. Returns True if document deleted."""
         ...
 
     async def delete_document_chunks(self, document_id: int) -> None: ...
@@ -129,6 +143,8 @@ class SearchBackend(Protocol):
     async def get_chunks_by_ids(self, ids: list[int]) -> list[ChunkRecord]: ...
 
     async def get_document_by_path(self, path: str, category: str) -> DocumentRecord | None: ...
+
+    async def get_document_by_checksum(self, checksum: str, category: str) -> DocumentRecord | None: ...
 
     async def list_documents(self, category: str | None = None) -> list[DocumentRecord]: ...
 
@@ -165,7 +181,6 @@ PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS documents (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    path             TEXT NOT NULL,
     title            TEXT NOT NULL,
     file_type        TEXT NOT NULL,
     category         TEXT NOT NULL,
@@ -174,8 +189,18 @@ CREATE TABLE IF NOT EXISTS documents (
     status           TEXT NOT NULL DEFAULT 'ok',
     indexed_at       TEXT,
     chunk_count      INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(path, category)
+    UNIQUE(checksum, category)
 );
+
+-- One document can live at multiple paths (duplicate files)
+CREATE TABLE IF NOT EXISTS document_paths (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    UNIQUE(document_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_paths_path ON document_paths(path);
 
 CREATE TABLE IF NOT EXISTS chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,6 +259,13 @@ CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON chunks BEGIN
 END;
 """
 
+_DOCS_WITH_PATHS = """
+    SELECT d.*,
+           GROUP_CONCAT(dp.path, '{sep}') AS all_paths
+    FROM documents d
+    LEFT JOIN document_paths dp ON dp.document_id = d.id
+""".format(sep=_PATH_SEP)
+
 
 class SQLiteBackend:
     """SQLite backend using sqlite-vec for vector search and FTS5 for keyword search."""
@@ -245,7 +277,7 @@ class SQLiteBackend:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        # Load sqlite-vec extension for vector search
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             import sqlite_vec
 
@@ -253,14 +285,12 @@ class SQLiteBackend:
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
         except Exception as exc:
-            # Vector search unavailable - continue with keyword-only
             import sys
 
             print(f"[doc-search] Warning: sqlite-vec unavailable: {exc}", file=sys.stderr)
         return conn
 
     async def _run(self, fn):
-        """Run a synchronous sqlite call in a thread, holding the write lock."""
         loop = asyncio.get_event_loop()
         async with self._lock:
             return await loop.run_in_executor(None, fn)
@@ -271,14 +301,13 @@ class SQLiteBackend:
         def _init():
             conn = self._connect()
             conn.executescript(_SCHEMA)
-            # Create the vec0 virtual table separately (requires the extension loaded)
             try:
                 conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[768])"
                 )
                 conn.commit()
             except sqlite3.OperationalError:
-                pass  # extension not loaded, vector search unavailable
+                pass
             conn.commit()
             conn.close()
 
@@ -290,39 +319,84 @@ class SQLiteBackend:
         def _upsert():
             conn = self._connect()
             now = datetime.utcnow().isoformat()
-            cur = conn.execute(
-                """
-                INSERT INTO documents (path, title, file_type, category, checksum,
-                    structure_source, status, indexed_at, chunk_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(path, category) DO UPDATE SET
-                    title=excluded.title,
-                    file_type=excluded.file_type,
-                    checksum=excluded.checksum,
-                    structure_source=excluded.structure_source,
-                    status=excluded.status,
-                    indexed_at=excluded.indexed_at,
-                    chunk_count=excluded.chunk_count
-                RETURNING id
-                """,
-                (
-                    doc.path,
-                    doc.title,
-                    doc.file_type,
-                    doc.category,
-                    doc.checksum,
-                    doc.structure_source,
-                    doc.status,
-                    now,
-                    doc.chunk_count,
-                ),
-            )
-            row = cur.fetchone()
+
+            existing = conn.execute(
+                "SELECT id FROM documents WHERE checksum = ? AND category = ?",
+                (doc.checksum, doc.category),
+            ).fetchone()
+
+            if existing:
+                doc_id = existing["id"]
+                conn.execute(
+                    """UPDATE documents SET title=?, file_type=?, structure_source=?,
+                       status=?, indexed_at=?, chunk_count=? WHERE id=?""",
+                    (doc.title, doc.file_type, doc.structure_source,
+                     doc.status, now, doc.chunk_count, doc_id),
+                )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO documents
+                           (title, file_type, category, checksum, structure_source, status, indexed_at, chunk_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (doc.title, doc.file_type, doc.category, doc.checksum,
+                     doc.structure_source, doc.status, now, doc.chunk_count),
+                )
+                doc_id = cur.lastrowid
+
+            for path in doc.paths:
+                conn.execute(
+                    "INSERT OR IGNORE INTO document_paths (document_id, path) VALUES (?, ?)",
+                    (doc_id, path),
+                )
+
             conn.commit()
             conn.close()
-            return row[0]
+            return doc_id
 
         return await self._run(_upsert)
+
+    async def add_path(self, document_id: int, path: str) -> None:
+        def _add():
+            conn = self._connect()
+            conn.execute(
+                "INSERT OR IGNORE INTO document_paths (document_id, path) VALUES (?, ?)",
+                (document_id, path),
+            )
+            conn.commit()
+            conn.close()
+
+        await self._run(_add)
+
+    async def remove_path(self, path: str, category: str) -> bool:
+        """Remove a path. Deletes the document if it was the last path. Returns True if document deleted."""
+        def _remove():
+            conn = self._connect()
+            row = conn.execute(
+                """SELECT dp.document_id FROM document_paths dp
+                   JOIN documents d ON d.id = dp.document_id
+                   WHERE dp.path = ? AND d.category = ?""",
+                (path, category),
+            ).fetchone()
+            if row is None:
+                conn.close()
+                return False
+            doc_id = row["document_id"]
+            conn.execute(
+                "DELETE FROM document_paths WHERE document_id = ? AND path = ?",
+                (doc_id, path),
+            )
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM document_paths WHERE document_id = ?", (doc_id,)
+            ).fetchone()[0]
+            deleted = False
+            if remaining == 0:
+                conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+                deleted = True
+            conn.commit()
+            conn.close()
+            return deleted
+
+        return await self._run(_remove)
 
     async def delete_document_chunks(self, document_id: int) -> None:
         def _delete():
@@ -354,7 +428,7 @@ class SQLiteBackend:
                             (chunk_id, blob),
                         )
                     except Exception:
-                        pass  # vec table not available
+                        pass
             conn.commit()
             conn.close()
             return ids
@@ -364,25 +438,48 @@ class SQLiteBackend:
     async def get_document_by_path(self, path: str, category: str) -> DocumentRecord | None:
         def _get():
             conn = self._connect()
+            # Join dp_match to locate the document by path, then dp_all to collect every path
             row = conn.execute(
-                "SELECT * FROM documents WHERE path = ? AND category = ?", (path, category)
+                """
+                SELECT d.*, GROUP_CONCAT(dp_all.path, ?) AS all_paths
+                FROM documents d
+                JOIN document_paths dp_match ON dp_match.document_id = d.id AND dp_match.path = ?
+                LEFT JOIN document_paths dp_all ON dp_all.document_id = d.id
+                WHERE d.category = ?
+                GROUP BY d.id
+                """,
+                (_PATH_SEP, path, category),
             ).fetchone()
             conn.close()
             return row
 
         row = await self._run(_get)
-        if row is None:
-            return None
-        return _row_to_document(row)
+        return _row_to_document(row) if row else None
+
+    async def get_document_by_checksum(self, checksum: str, category: str) -> DocumentRecord | None:
+        def _get():
+            conn = self._connect()
+            row = conn.execute(
+                _DOCS_WITH_PATHS + "WHERE d.checksum = ? AND d.category = ? GROUP BY d.id",
+                (checksum, category),
+            ).fetchone()
+            conn.close()
+            return row
+
+        row = await self._run(_get)
+        return _row_to_document(row) if row else None
 
     async def list_documents(self, category: str | None = None) -> list[DocumentRecord]:
         def _list():
             conn = self._connect()
             if category is None:
-                rows = conn.execute("SELECT * FROM documents ORDER BY category, path").fetchall()
+                rows = conn.execute(
+                    _DOCS_WITH_PATHS + "GROUP BY d.id ORDER BY d.category, d.title"
+                ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM documents WHERE category = ? ORDER BY path", (category,)
+                    _DOCS_WITH_PATHS + "WHERE d.category = ? GROUP BY d.id ORDER BY d.title",
+                    (category,),
                 ).fetchall()
             conn.close()
             return rows
@@ -463,7 +560,9 @@ class SQLiteBackend:
                 conditions.append("d.file_type = ?")
                 params.append(file_type)
             if path_prefix:
-                conditions.append("d.path LIKE ?")
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM document_paths dp2 WHERE dp2.document_id = d.id AND dp2.path LIKE ?)"
+                )
                 params.append(f"{path_prefix}%")
             where = " AND ".join(conditions)
             params.append(limit)
@@ -493,7 +592,7 @@ class SQLiteBackend:
                 page_or_section=r["page_or_section"],
                 title=r["title"],
                 category=r["category"],
-                score=abs(r["score"]),  # bm25 returns negative values
+                score=abs(r["score"]),
             )
             for r in rows
         ]
@@ -520,7 +619,9 @@ class SQLiteBackend:
                 conditions.append("d.file_type = ?")
                 params.append(file_type)
             if path_prefix:
-                conditions.append("d.path LIKE ?")
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM document_paths dp2 WHERE dp2.document_id = d.id AND dp2.path LIKE ?)"
+                )
                 params.append(f"{path_prefix}%")
             where = ("AND " + " AND ".join(conditions)) if conditions else ""
             params.append(limit)
@@ -584,12 +685,7 @@ class SQLiteBackend:
             conn = self._connect()
             cur = conn.execute(
                 "INSERT INTO warnings (document_id, category, warning_type, detected_at) VALUES (?, ?, ?, ?)",
-                (
-                    warning.document_id,
-                    warning.category,
-                    warning.warning_type,
-                    warning.detected_at.isoformat(),
-                ),
+                (warning.document_id, warning.category, warning.warning_type, warning.detected_at.isoformat()),
             )
             conn.commit()
             conn.close()
@@ -653,17 +749,10 @@ class SQLiteBackend:
                     updated_at=excluded.updated_at
                 """,
                 (
-                    job.id,
-                    job.path,
-                    job.category,
-                    job.status,
-                    job.total_files,
-                    job.completed_files,
-                    job.total_chunks,
-                    job.embedded_chunks,
-                    job.error_count,
-                    job.started_at.isoformat(),
-                    job.updated_at.isoformat(),
+                    job.id, job.path, job.category, job.status,
+                    job.total_files, job.completed_files, job.total_chunks,
+                    job.embedded_chunks, job.error_count,
+                    job.started_at.isoformat(), job.updated_at.isoformat(),
                 ),
             )
             conn.commit()
@@ -729,9 +818,12 @@ class SQLiteBackend:
 
 
 def _row_to_document(row: sqlite3.Row) -> DocumentRecord:
+    keys = row.keys()
+    all_paths_raw = row["all_paths"] if "all_paths" in keys else ""
+    paths = [p for p in (all_paths_raw or "").split(_PATH_SEP) if p]
     return DocumentRecord(
         id=row["id"],
-        path=row["path"],
+        paths=paths,
         title=row["title"],
         file_type=row["file_type"],
         category=row["category"],
@@ -771,7 +863,6 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
 
 
 def make_backend(config) -> SearchBackend:
-    """Construct the configured backend from a Config object."""
     from doc_search_mcp.config import Config
 
     cfg: Config = config

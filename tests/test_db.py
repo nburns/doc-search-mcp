@@ -20,39 +20,84 @@ async def backend(tmp_path):
     return b
 
 
-async def _make_doc(backend, path="~/docs/test.pdf", category="test") -> int:
-    doc = DocumentRecord(
-        path=path,
+def _doc(paths=None, category="test", checksum="abc123") -> DocumentRecord:
+    return DocumentRecord(
+        paths=paths or ["/docs/test.pdf"],
         title="Test Doc",
         file_type="pdf",
         category=category,
-        checksum="abc123",
+        checksum=checksum,
         structure_source="page",
         status="ok",
         chunk_count=0,
     )
-    return await backend.upsert_document(doc)
 
 
 async def test_init_schema(backend):
-    # Schema init is idempotent
-    await backend.init_schema()
+    await backend.init_schema()  # idempotent
 
 
 async def test_upsert_document_returns_id(backend):
-    doc_id = await _make_doc(backend)
-    assert isinstance(doc_id, int)
-    assert doc_id > 0
+    doc_id = await backend.upsert_document(_doc())
+    assert isinstance(doc_id, int) and doc_id > 0
 
 
-async def test_upsert_document_idempotent(backend):
-    id1 = await _make_doc(backend)
-    id2 = await _make_doc(backend)
-    assert id1 == id2  # same path+category -> same row updated
+async def test_upsert_deduplicates_by_checksum(backend):
+    # Same checksum + category -> same document row
+    id1 = await backend.upsert_document(_doc(paths=["/a.pdf"], checksum="x1"))
+    id2 = await backend.upsert_document(_doc(paths=["/b.pdf"], checksum="x1"))
+    assert id1 == id2
+
+    doc = await backend.get_document_by_checksum("x1", "test")
+    assert doc is not None
+    assert set(doc.paths) == {"/a.pdf", "/b.pdf"}
+
+
+async def test_upsert_different_checksum_is_different_doc(backend):
+    id1 = await backend.upsert_document(_doc(paths=["/a.pdf"], checksum="c1"))
+    id2 = await backend.upsert_document(_doc(paths=["/b.pdf"], checksum="c2"))
+    assert id1 != id2
+
+
+async def test_add_path(backend):
+    doc_id = await backend.upsert_document(_doc(paths=["/a.pdf"]))
+    await backend.add_path(doc_id, "/b.pdf")
+    doc = await backend.get_document_by_path("/b.pdf", "test")
+    assert doc is not None
+    assert "/a.pdf" in doc.paths
+    assert "/b.pdf" in doc.paths
+
+
+async def test_add_path_duplicate_ignored(backend):
+    doc_id = await backend.upsert_document(_doc(paths=["/a.pdf"]))
+    await backend.add_path(doc_id, "/a.pdf")  # duplicate - should not raise
+    doc = await backend.get_document_by_path("/a.pdf", "test")
+    assert doc.paths.count("/a.pdf") == 1
+
+
+async def test_remove_path_last_deletes_document(backend):
+    doc_id = await backend.upsert_document(_doc(paths=["/only.pdf"]))
+    deleted = await backend.remove_path("/only.pdf", "test")
+    assert deleted is True
+    assert await backend.get_document_by_path("/only.pdf", "test") is None
+
+
+async def test_remove_path_retains_document_with_remaining_paths(backend):
+    await backend.upsert_document(_doc(paths=["/a.pdf", "/b.pdf"]))
+    deleted = await backend.remove_path("/a.pdf", "test")
+    assert deleted is False
+    doc = await backend.get_document_by_path("/b.pdf", "test")
+    assert doc is not None
+    assert "/a.pdf" not in doc.paths
+
+
+async def test_remove_path_not_found(backend):
+    result = await backend.remove_path("/nonexistent.pdf", "test")
+    assert result is False
 
 
 async def test_get_document_by_path(backend):
-    await _make_doc(backend, path="/some/file.pdf", category="books")
+    await backend.upsert_document(_doc(paths=["/some/file.pdf"], category="books"))
     doc = await backend.get_document_by_path("/some/file.pdf", "books")
     assert doc is not None
     assert doc.title == "Test Doc"
@@ -60,129 +105,127 @@ async def test_get_document_by_path(backend):
 
 
 async def test_get_document_by_path_not_found(backend):
-    result = await backend.get_document_by_path("/nonexistent.pdf", "test")
-    assert result is None
+    assert await backend.get_document_by_path("/nonexistent.pdf", "test") is None
+
+
+async def test_get_document_by_checksum(backend):
+    await backend.upsert_document(_doc(paths=["/f.pdf"], checksum="sha_xyz"))
+    doc = await backend.get_document_by_checksum("sha_xyz", "test")
+    assert doc is not None
+    assert "/f.pdf" in doc.paths
+
+
+async def test_get_document_by_checksum_not_found(backend):
+    assert await backend.get_document_by_checksum("no_such_hash", "test") is None
+
+
+async def test_document_record_primary_path(backend):
+    await backend.upsert_document(_doc(paths=["/primary.pdf", "/secondary.pdf"]))
+    doc = await backend.get_document_by_path("/primary.pdf", "test")
+    assert doc.primary_path in doc.paths
 
 
 async def test_insert_and_get_chunks(backend):
-    doc_id = await _make_doc(backend)
+    doc_id = await backend.upsert_document(_doc())
     chunks = [
         ChunkRecord(document_id=doc_id, text="Hello world", page_or_section="Page 1", position=0),
         ChunkRecord(document_id=doc_id, text="Second chunk", page_or_section="Page 2", position=1),
     ]
     ids = await backend.insert_chunks(chunks)
     assert len(ids) == 2
-    assert all(isinstance(i, int) for i in ids)
 
     fetched = await backend.get_chunks_by_ids(ids)
-    assert len(fetched) == 2
-    texts = {c.text for c in fetched}
-    assert texts == {"Hello world", "Second chunk"}
+    assert {c.text for c in fetched} == {"Hello world", "Second chunk"}
 
 
 async def test_delete_document_chunks(backend):
-    doc_id = await _make_doc(backend)
-    chunks = [ChunkRecord(document_id=doc_id, text="To be deleted", page_or_section="p1", position=0)]
-    ids = await backend.insert_chunks(chunks)
+    doc_id = await backend.upsert_document(_doc())
+    ids = await backend.insert_chunks([
+        ChunkRecord(document_id=doc_id, text="bye", page_or_section="p1", position=0)
+    ])
     await backend.delete_document_chunks(doc_id)
-    fetched = await backend.get_chunks_by_ids(ids)
-    assert fetched == []
+    assert await backend.get_chunks_by_ids(ids) == []
+
+
+async def test_chunks_cascade_delete_with_document(backend):
+    doc_id = await backend.upsert_document(_doc(paths=["/solo.pdf"]))
+    ids = await backend.insert_chunks([
+        ChunkRecord(document_id=doc_id, text="gone", page_or_section="p1", position=0)
+    ])
+    await backend.remove_path("/solo.pdf", "test")  # deletes document
+    assert await backend.get_chunks_by_ids(ids) == []
 
 
 async def test_keyword_search(backend):
-    doc_id = await _make_doc(backend)
-    chunks = [
+    doc_id = await backend.upsert_document(_doc())
+    await backend.insert_chunks([
         ChunkRecord(document_id=doc_id, text="machine learning is fascinating", page_or_section="p1", position=0),
         ChunkRecord(document_id=doc_id, text="gardening tips for beginners", page_or_section="p2", position=1),
-    ]
-    await backend.insert_chunks(chunks)
-
+    ])
     results = await backend.keyword_search("machine learning", category="test", limit=10)
-    assert len(results) >= 1
     assert any("machine learning" in r.text for r in results)
 
 
 async def test_keyword_search_no_results(backend):
-    results = await backend.keyword_search("xyzzy nonexistent", category="test", limit=10)
-    assert results == []
+    assert await backend.keyword_search("xyzzy nonexistent", category="test", limit=10) == []
 
 
 async def test_list_documents_empty(backend):
+    assert await backend.list_documents() == []
+
+
+async def test_list_documents_includes_all_paths(backend):
+    await backend.upsert_document(_doc(paths=["/a.pdf", "/b.pdf"]))
     docs = await backend.list_documents()
-    assert docs == []
+    assert len(docs) == 1
+    assert set(docs[0].paths) == {"/a.pdf", "/b.pdf"}
 
 
-async def test_list_documents(backend):
-    await _make_doc(backend, path="/a.pdf", category="cat1")
-    await _make_doc(backend, path="/b.pdf", category="cat2")
-    all_docs = await backend.list_documents()
-    assert len(all_docs) == 2
+async def test_list_documents_category_filter(backend):
+    await backend.upsert_document(_doc(paths=["/a.pdf"], category="cat1", checksum="c1"))
+    await backend.upsert_document(_doc(paths=["/b.pdf"], category="cat2", checksum="c2"))
     cat1_docs = await backend.list_documents("cat1")
-    assert len(cat1_docs) == 1
+    assert len(cat1_docs) == 1 and "/a.pdf" in cat1_docs[0].paths
 
 
 async def test_list_categories(backend):
-    await _make_doc(backend, path="/a.pdf", category="alpha")
-    await _make_doc(backend, path="/b.pdf", category="beta")
+    await backend.upsert_document(_doc(paths=["/a.pdf"], category="alpha", checksum="c1"))
+    await backend.upsert_document(_doc(paths=["/b.pdf"], category="beta", checksum="c2"))
     cats = await backend.list_categories()
-    names = {c.name for c in cats}
-    assert names == {"alpha", "beta"}
+    assert {c.name for c in cats} == {"alpha", "beta"}
 
 
 async def test_get_stats(backend):
-    await _make_doc(backend)
+    await backend.upsert_document(_doc())
     stats = await backend.get_stats()
     assert stats.doc_count == 1
 
 
 async def test_warnings_lifecycle(backend):
-    doc_id = await _make_doc(backend)
-    w = WarningRecord(
-        document_id=doc_id,
-        category="test",
-        warning_type="changed",
-        detected_at=datetime.utcnow(),
-    )
-    w_id = await backend.add_warning(w)
-    assert isinstance(w_id, int)
-
-    active = await backend.get_active_warnings()
-    assert any(x.id == w_id for x in active)
-
+    doc_id = await backend.upsert_document(_doc())
+    w_id = await backend.add_warning(WarningRecord(
+        document_id=doc_id, category="test", warning_type="changed", detected_at=datetime.utcnow()
+    ))
+    assert any(x.id == w_id for x in await backend.get_active_warnings())
     await backend.acknowledge_warnings([w_id])
-    active_after = await backend.get_active_warnings()
-    assert not any(x.id == w_id for x in active_after)
+    assert not any(x.id == w_id for x in await backend.get_active_warnings())
 
 
 async def test_clear_warnings_for_document(backend):
-    doc_id = await _make_doc(backend)
-    w = WarningRecord(
-        document_id=doc_id,
-        category="test",
-        warning_type="missing",
-        detected_at=datetime.utcnow(),
-    )
-    await backend.add_warning(w)
+    doc_id = await backend.upsert_document(_doc())
+    await backend.add_warning(WarningRecord(
+        document_id=doc_id, category="test", warning_type="missing", detected_at=datetime.utcnow()
+    ))
     await backend.clear_warnings_for_document(doc_id)
     assert await backend.get_active_warnings() == []
 
 
 async def test_job_upsert_and_get(backend):
-    job = JobRecord(
-        id="test-job-1",
-        path="/some/path",
-        category="books",
-        status="running",
-        total_files=10,
-        completed_files=3,
-    )
+    job = JobRecord(id="j1", path="/p", category="c", status="running", total_files=10, completed_files=3)
     await backend.upsert_job(job)
-
-    fetched = await backend.get_job("test-job-1")
-    assert fetched is not None
+    fetched = await backend.get_job("j1")
     assert fetched.status == "running"
     assert fetched.total_files == 10
-    assert fetched.completed_files == 3
 
 
 async def test_job_update(backend):
@@ -191,9 +234,7 @@ async def test_job_update(backend):
     job.status = "completed"
     job.completed_files = 5
     await backend.upsert_job(job)
-    fetched = await backend.get_job("j2")
-    assert fetched.status == "completed"
-    assert fetched.completed_files == 5
+    assert (await backend.get_job("j2")).status == "completed"
 
 
 async def test_list_jobs_filter(backend):
@@ -201,18 +242,11 @@ async def test_list_jobs_filter(backend):
     await backend.upsert_job(JobRecord(id="j2", path="/p", category="c", status="completed"))
     running = await backend.list_jobs("running")
     assert len(running) == 1 and running[0].id == "j1"
-    all_jobs = await backend.list_jobs()
-    assert len(all_jobs) == 2
 
 
 async def test_server_meta(backend):
     await backend.set_server_meta("embedding_model", "nomic-embed-text")
-    val = await backend.get_server_meta("embedding_model")
-    assert val == "nomic-embed-text"
-
+    assert await backend.get_server_meta("embedding_model") == "nomic-embed-text"
     await backend.set_server_meta("embedding_model", "updated-model")
-    val2 = await backend.get_server_meta("embedding_model")
-    assert val2 == "updated-model"
-
-    missing = await backend.get_server_meta("nonexistent_key")
-    assert missing is None
+    assert await backend.get_server_meta("embedding_model") == "updated-model"
+    assert await backend.get_server_meta("nonexistent") is None

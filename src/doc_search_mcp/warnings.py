@@ -29,8 +29,15 @@ async def run_startup_check(backend: SearchBackend) -> int:
     )
 
     for doc in docs:
-        path = Path(doc.path)
-        if not path.exists():
+        # A document may have multiple paths (duplicate files). Check all of them.
+        # Warn if every path is missing, or if any readable path has a changed checksum.
+        all_missing = all(not Path(p).exists() for p in doc.paths)
+        any_changed = any(
+            Path(p).exists() and _checksum(Path(p)) != doc.checksum
+            for p in doc.paths
+        )
+
+        if all_missing and doc.paths:
             missing += 1
             await backend.add_warning(
                 WarningRecord(
@@ -40,18 +47,16 @@ async def run_startup_check(backend: SearchBackend) -> int:
                     detected_at=datetime.utcnow(),
                 )
             )
-        else:
-            current_checksum = _checksum(path)
-            if current_checksum != doc.checksum:
-                changed += 1
-                await backend.add_warning(
-                    WarningRecord(
-                        document_id=doc.id,  # type: ignore[arg-type]
-                        category=doc.category,
-                        warning_type="changed",
-                        detected_at=datetime.utcnow(),
-                    )
+        elif any_changed:
+            changed += 1
+            await backend.add_warning(
+                WarningRecord(
+                    document_id=doc.id,  # type: ignore[arg-type]
+                    category=doc.category,
+                    warning_type="changed",
+                    detected_at=datetime.utcnow(),
                 )
+            )
 
     if changed:
         print(f"[doc-search] ⚠️  {changed} files changed since last index", file=sys.stderr)

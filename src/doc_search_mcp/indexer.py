@@ -91,10 +91,20 @@ async def _extract_one(
             job.current_files.append(path.name)
             checksum = await _checksum_async(path)
 
-            existing = await backend.get_document_by_path(str(path), category)
-            if existing and existing.checksum == checksum:
+            # Dedup: if content already indexed under this category, just register the path
+            existing_by_checksum = await backend.get_document_by_checksum(checksum, category)
+            if existing_by_checksum:
+                await backend.add_path(existing_by_checksum.id, str(path))
                 job.completed_files += 1
-                return  # unchanged
+                return
+
+            # Check if this path was previously indexed with different content
+            existing_by_path = await backend.get_document_by_path(str(path), category)
+            if existing_by_path:
+                # Content changed - disassociate path from old document
+                # (leaves old document intact if other paths still reference it)
+                await backend.remove_path(str(path), category)
+                await backend.clear_warnings_for_document(existing_by_path.id)
 
             loop = asyncio.get_event_loop()
             raw_chunks, structure_source = await loop.run_in_executor(
@@ -103,7 +113,7 @@ async def _extract_one(
 
             title = path.stem.replace("-", " ").replace("_", " ").title()
             doc = DocumentRecord(
-                path=str(path),
+                paths=[str(path)],
                 title=title,
                 file_type=path.suffix.lstrip(".").lower(),
                 category=category,
@@ -113,8 +123,6 @@ async def _extract_one(
                 chunk_count=0,
             )
             doc_id = await backend.upsert_document(doc)
-            if existing:
-                await backend.delete_document_chunks(doc_id)
 
             spans = [_Span(text=c.text, page_or_section=c.page_or_section) for c in raw_chunks]
             chunks = chunk_raw(

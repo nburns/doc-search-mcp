@@ -235,9 +235,11 @@ async def _dispatch(name: str, args: dict) -> str:
         doc = await _backend.get_document_by_path(args["path"], args["category"])
         if doc is None:
             return f"No document found at {args['path']!r} in category {args['category']!r}"
-        await _backend.delete_document_chunks(doc.id)  # type: ignore[arg-type]
-        await _backend.clear_warnings_for_document(doc.id)  # type: ignore[arg-type]
-        return f"Removed: {args['path']}"
+        deleted = await _backend.remove_path(args["path"], args["category"])
+        if deleted:
+            return f"Removed: {args['path']} (document fully deleted — no remaining paths)"
+        remaining = [p for p in doc.paths if p != args["path"]]
+        return f"Removed path: {args['path']}\nDocument retained — still reachable at: {remaining}"
 
     if name == "search":
         return await search.search(
@@ -277,10 +279,11 @@ async def _dispatch(name: str, args: dict) -> str:
         docs = await _backend.list_documents(args.get("category"))
         if not docs:
             return "No documents indexed."
-        lines = [f"| Path | Title | Type | Status | Chunks |",
-                 f"|------|-------|------|--------|--------|"]
+        lines = ["| Path(s) | Title | Type | Status | Chunks |",
+                 "|---------|-------|------|--------|--------|"]
         for d in docs:
-            lines.append(f"| {d.path} | {d.title} | {d.file_type} | {d.status} | {d.chunk_count} |")
+            paths_str = ", ".join(d.paths)
+            lines.append(f"| {paths_str} | {d.title} | {d.file_type} | {d.status} | {d.chunk_count} |")
         footer = await warning_footer(_backend)
         return "\n".join(lines) + footer
 
@@ -346,16 +349,19 @@ async def _dispatch(name: str, args: dict) -> str:
         return f"Could not cancel job {args['job_id'][:8]} — not found or not running."
 
     if name == "check_index":
+        from doc_search_mcp.warnings import _checksum
+
         docs = await _backend.list_documents(args.get("category"))
         issues: list[str] = []
         for doc in docs:
-            p = Path(doc.path)
-            if not p.exists():
-                issues.append(f"❌ Missing: {doc.path}")
-            else:
-                from doc_search_mcp.warnings import _checksum
-                if _checksum(p) != doc.checksum:
-                    issues.append(f"⚠️  Changed: {doc.path}")
+            readable = [p for p in doc.paths if Path(p).exists()]
+            missing = [p for p in doc.paths if not Path(p).exists()]
+            if missing:
+                for p in missing:
+                    issues.append(f"❌ Missing: {p}")
+            for p in readable:
+                if _checksum(Path(p)) != doc.checksum:
+                    issues.append(f"⚠️  Changed: {p}")
         if not issues:
             return f"✅ Index is healthy ({len(docs)} documents checked)."
         return "\n".join(issues) + f"\n\n{len(issues)} issue(s) found. Use `reindex_path` or `remove_document` to resolve."
