@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 # Data records
 # ---------------------------------------------------------------------------
 
-_PATH_SEP = "|||"  # unlikely to appear in file paths; safe in SQL strings
+_PATH_SEP = "\x00"  # null byte - cannot appear in file paths
 
 
 @dataclass
@@ -259,12 +259,7 @@ CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON chunks BEGIN
 END;
 """
 
-_DOCS_WITH_PATHS = """
-    SELECT d.*,
-           GROUP_CONCAT(dp.path, '{sep}') AS all_paths
-    FROM documents d
-    LEFT JOIN document_paths dp ON dp.document_id = d.id
-""".format(sep=_PATH_SEP)
+
 
 
 class SQLiteBackend:
@@ -438,7 +433,7 @@ class SQLiteBackend:
     async def get_document_by_path(self, path: str, category: str) -> DocumentRecord | None:
         def _get():
             conn = self._connect()
-            # Join dp_match to locate the document by path, then dp_all to collect every path
+            # dp_match locates the document; dp_all collects every path for it
             row = conn.execute(
                 """
                 SELECT d.*, GROUP_CONCAT(dp_all.path, ?) AS all_paths
@@ -460,8 +455,14 @@ class SQLiteBackend:
         def _get():
             conn = self._connect()
             row = conn.execute(
-                _DOCS_WITH_PATHS + "WHERE d.checksum = ? AND d.category = ? GROUP BY d.id",
-                (checksum, category),
+                """
+                SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
+                FROM documents d
+                LEFT JOIN document_paths dp ON dp.document_id = d.id
+                WHERE d.checksum = ? AND d.category = ?
+                GROUP BY d.id
+                """,
+                (_PATH_SEP, checksum, category),
             ).fetchone()
             conn.close()
             return row
@@ -474,12 +475,24 @@ class SQLiteBackend:
             conn = self._connect()
             if category is None:
                 rows = conn.execute(
-                    _DOCS_WITH_PATHS + "GROUP BY d.id ORDER BY d.category, d.title"
+                    """
+                    SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
+                    FROM documents d
+                    LEFT JOIN document_paths dp ON dp.document_id = d.id
+                    GROUP BY d.id ORDER BY d.category, d.title
+                    """,
+                    (_PATH_SEP,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    _DOCS_WITH_PATHS + "WHERE d.category = ? GROUP BY d.id ORDER BY d.title",
-                    (category,),
+                    """
+                    SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
+                    FROM documents d
+                    LEFT JOIN document_paths dp ON dp.document_id = d.id
+                    WHERE d.category = ?
+                    GROUP BY d.id ORDER BY d.title
+                    """,
+                    (_PATH_SEP, category),
                 ).fetchall()
             conn.close()
             return rows
