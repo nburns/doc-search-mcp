@@ -519,12 +519,23 @@ class SQLiteBackend:
             conn = self._connect()
             if category:
                 row = conn.execute(
-                    "SELECT COUNT(*) AS doc_count, SUM(chunk_count) AS chunk_count FROM documents WHERE category = ?",
+                    """
+                    SELECT COUNT(DISTINCT d.id) AS doc_count,
+                           COUNT(c.id)          AS chunk_count
+                    FROM documents d
+                    LEFT JOIN chunks c ON c.document_id = d.id
+                    WHERE d.category = ?
+                    """,
                     (category,),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT COUNT(*) AS doc_count, SUM(chunk_count) AS chunk_count FROM documents"
+                    """
+                    SELECT COUNT(DISTINCT d.id) AS doc_count,
+                           COUNT(c.id)          AS chunk_count
+                    FROM documents d
+                    LEFT JOIN chunks c ON c.document_id = d.id
+                    """
                 ).fetchone()
             size = self._db_path.stat().st_size if self._db_path.exists() else 0
             conn.close()
