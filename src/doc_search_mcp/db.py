@@ -12,7 +12,6 @@ from typing import Protocol, runtime_checkable
 # Data records
 # ---------------------------------------------------------------------------
 
-_PATH_SEP = "\x1f"  # ASCII unit separator - cannot appear in file paths
 
 
 @dataclass
@@ -433,72 +432,59 @@ class SQLiteBackend:
     async def get_document_by_path(self, path: str, category: str) -> DocumentRecord | None:
         def _get():
             conn = self._connect()
-            # dp_match locates the document; dp_all collects every path for it
             row = conn.execute(
                 """
-                SELECT d.*, GROUP_CONCAT(dp_all.path, ?) AS all_paths
-                FROM documents d
-                JOIN document_paths dp_match ON dp_match.document_id = d.id AND dp_match.path = ?
-                LEFT JOIN document_paths dp_all ON dp_all.document_id = d.id
-                WHERE d.category = ?
-                GROUP BY d.id
+                SELECT d.* FROM documents d
+                JOIN document_paths dp ON dp.document_id = d.id
+                WHERE dp.path = ? AND d.category = ?
                 """,
-                (_PATH_SEP, path, category),
+                (path, category),
             ).fetchone()
+            if row is None:
+                conn.close()
+                return None
+            paths = _fetch_paths(conn, row["id"])
             conn.close()
-            return row
+            return row, paths
 
-        row = await self._run(_get)
-        return _row_to_document(row) if row else None
+        result = await self._run(_get)
+        return _row_to_document(*result) if result else None
 
     async def get_document_by_checksum(self, checksum: str, category: str) -> DocumentRecord | None:
         def _get():
             conn = self._connect()
             row = conn.execute(
-                """
-                SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
-                FROM documents d
-                LEFT JOIN document_paths dp ON dp.document_id = d.id
-                WHERE d.checksum = ? AND d.category = ?
-                GROUP BY d.id
-                """,
-                (_PATH_SEP, checksum, category),
+                "SELECT * FROM documents WHERE checksum = ? AND category = ?",
+                (checksum, category),
             ).fetchone()
+            if row is None:
+                conn.close()
+                return None
+            paths = _fetch_paths(conn, row["id"])
             conn.close()
-            return row
+            return row, paths
 
-        row = await self._run(_get)
-        return _row_to_document(row) if row else None
+        result = await self._run(_get)
+        return _row_to_document(*result) if result else None
 
     async def list_documents(self, category: str | None = None) -> list[DocumentRecord]:
         def _list():
             conn = self._connect()
             if category is None:
                 rows = conn.execute(
-                    """
-                    SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
-                    FROM documents d
-                    LEFT JOIN document_paths dp ON dp.document_id = d.id
-                    GROUP BY d.id ORDER BY d.category, d.title
-                    """,
-                    (_PATH_SEP,),
+                    "SELECT * FROM documents ORDER BY category, title"
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
-                    SELECT d.*, GROUP_CONCAT(dp.path, ?) AS all_paths
-                    FROM documents d
-                    LEFT JOIN document_paths dp ON dp.document_id = d.id
-                    WHERE d.category = ?
-                    GROUP BY d.id ORDER BY d.title
-                    """,
-                    (_PATH_SEP, category),
+                    "SELECT * FROM documents WHERE category = ? ORDER BY title",
+                    (category,),
                 ).fetchall()
+            results = [(row, _fetch_paths(conn, row["id"])) for row in rows]
             conn.close()
-            return rows
+            return results
 
-        rows = await self._run(_list)
-        return [_row_to_document(r) for r in rows]
+        results = await self._run(_list)
+        return [_row_to_document(row, paths) for row, paths in results]
 
     async def list_categories(self) -> list[CategoryInfo]:
         def _list():
@@ -830,10 +816,15 @@ class SQLiteBackend:
 # ---------------------------------------------------------------------------
 
 
-def _row_to_document(row: sqlite3.Row) -> DocumentRecord:
-    keys = row.keys()
-    all_paths_raw = row["all_paths"] if "all_paths" in keys else ""
-    paths = [p for p in (all_paths_raw or "").split(_PATH_SEP) if p]
+def _fetch_paths(conn: sqlite3.Connection, document_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT path FROM document_paths WHERE document_id = ? ORDER BY id",
+        (document_id,),
+    ).fetchall()
+    return [r["path"] for r in rows]
+
+
+def _row_to_document(row: sqlite3.Row, paths: list[str]) -> DocumentRecord:
     return DocumentRecord(
         id=row["id"],
         paths=paths,
