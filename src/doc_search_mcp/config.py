@@ -55,6 +55,7 @@ class PerformanceConfig:
     embedding_batch_size: int = 32
     embedding_queue_size: int = 256
     max_concurrent_jobs: int = 3
+    extraction_timeout: int = 1800  # seconds per file; covers large OCR jobs
 
 
 @dataclass
@@ -124,6 +125,9 @@ def _apply_toml(config: Config, data: dict) -> None:
         )
         config.performance.max_concurrent_jobs = int(
             perf.get("max_concurrent_jobs", config.performance.max_concurrent_jobs)
+        )
+        config.performance.extraction_timeout = int(
+            perf.get("extraction_timeout", config.performance.extraction_timeout)
         )
 
     if startup := data.get("startup"):

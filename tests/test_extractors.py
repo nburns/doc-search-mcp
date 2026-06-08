@@ -31,12 +31,18 @@ def test_plain_text_positions_are_sequential(tmp_path):
     assert [c.position for c in chunks] == list(range(len(chunks)))
 
 
-def test_plain_text_empty_file(tmp_path):
+def test_plain_text_empty_file_raises(tmp_path):
     f = tmp_path / "empty.txt"
     f.write_text("")
-    chunks = extract_text(f)
-    # Either empty list or single chunk with empty text - both acceptable
-    assert all(c.text.strip() == "" or c.text for c in chunks)
+    with pytest.raises(ValueError, match="empty"):
+        extract_text(f)
+
+
+def test_plain_text_whitespace_only_raises(tmp_path):
+    f = tmp_path / "blank.txt"
+    f.write_text("   \n\n   \n")
+    with pytest.raises(ValueError, match="empty"):
+        extract_text(f)
 
 
 def test_markdown_splits_on_headings(tmp_path):

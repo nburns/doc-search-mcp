@@ -26,17 +26,22 @@ Requires Python 3.10+. All dependencies are installed by default — no extras n
 
 ## Connect to Claude Code
 
-Add to your MCP server config:
+Start the server, then add an entry to `~/.claude/.mcp.json` (create it if it doesn't exist):
 
 ```json
 {
   "mcpServers": {
     "doc-search": {
-      "url": "http://<host>:8080/sse"
+      "type": "sse",
+      "url": "http://localhost:8080/sse"
     }
   }
 }
 ```
+
+Use the machine's hostname or IP instead of `localhost` if connecting from another machine.
+
+In a new Claude Code session, run `/mcp` to confirm the server is connected and its tools are listed.
 
 > No auth or TLS. Only expose on trusted local networks.
 
@@ -135,10 +140,21 @@ Set `backend = "none"` to skip embedding entirely and use keyword search only. T
 
 | Format | Notes |
 |--------|-------|
-| PDF | TOC-aware chunking; falls back to per-page if no TOC |
+| PDF | TOC-aware chunking; falls back to per-page if no TOC. Image-only PDFs are automatically OCR'd via tesseract if available. |
 | EPUB | Per-chapter extraction |
 | Markdown | Heading-aware splitting on `##` |
 | Plain text | Paragraph block splitting |
+
+### OCR for image-only PDFs
+
+If a PDF has no text layer, the extractor automatically falls back to OCR using [tesseract](https://github.com/tesseract-ocr/tesseract). Install the system binary to enable it:
+
+```bash
+sudo apt install tesseract-ocr        # Debian/Ubuntu
+brew install tesseract                 # macOS
+```
+
+Without tesseract, image-only PDFs fail with a clear error rather than silently producing an empty index entry.
 
 ## Dev
 

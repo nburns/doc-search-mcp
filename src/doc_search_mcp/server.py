@@ -202,6 +202,17 @@ _TOOLS = [
         description="Show current configuration and active backend.",
         inputSchema={"type": "object", "properties": {}},
     ),
+    types.Tool(
+        name="inspect_pdf",
+        description="Report per-page extraction stats for a PDF: which pages have text, character/word counts, TOC structure. Use to verify content coverage before or after indexing.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or ~ path to a PDF file"},
+            },
+            "required": ["path"],
+        },
+    ),
 ]
 
 
@@ -381,6 +392,38 @@ async def _dispatch(name: str, args: dict) -> str:
             f"- Rerank: {_config.search.rerank}\n"
             f"- Chunking: {_config.chunking.target_tokens} tokens, {_config.chunking.overlap_tokens} overlap\n"
         )
+
+    if name == "inspect_pdf":
+        from doc_search_mcp.extractors.pdf import inspect_pdf
+
+        path = Path(args["path"]).expanduser()
+        if not path.exists():
+            return f"File not found: {path}"
+        if path.suffix.lower() != ".pdf":
+            return f"Not a PDF: {path}"
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: inspect_pdf(path))
+
+        toc_note = f"{result.toc_entries} TOC entries" if result.toc_entries else "no TOC"
+        lines = [
+            f"**{path.name}**",
+            f"- Pages: {result.total_pages}",
+            f"- Pages with text: {result.pages_with_text}/{result.total_pages}",
+            f"- Structure: {result.structure_source} ({toc_note})",
+        ]
+        if result.empty_page_numbers:
+            shown = result.empty_page_numbers[:30]
+            tail = f" ... ({len(result.empty_page_numbers) - 30} more)" if len(result.empty_page_numbers) > 30 else ""
+            lines.append(f"- Empty pages: {shown}{tail}")
+        lines += [
+            "",
+            "| Page | Chars | Words | Text? |",
+            "|------|-------|-------|-------|",
+        ]
+        for stat in result.per_page:
+            flag = "yes" if stat.has_text else "**no**"
+            lines.append(f"| {stat.page} | {stat.char_count:,} | {stat.word_count:,} | {flag} |")
+        return "\n".join(lines)
 
     return f"Unknown tool: {name!r}"
 

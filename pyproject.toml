@@ -13,6 +13,8 @@ dependencies = [
     "beautifulsoup4",
     "tiktoken",
     "fastembed",
+    "pytesseract",
+    "Pillow",
     "sqlite-vec",
     "sentence-transformers",
     "asyncpg",

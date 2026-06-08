@@ -28,6 +28,8 @@ def extract_epub(path: Path) -> list[RawChunk]:
             chunks.append(RawChunk(text=text, page_or_section=title, position=position))
             position += 1
 
+    if not chunks:
+        raise ValueError(f"No text extracted from {path.name} - EPUB may have no readable content")
     return chunks
 
 

@@ -117,6 +117,8 @@ class SearchBackend(Protocol):
 
     async def delete_document_chunks(self, document_id: int) -> None: ...
 
+    async def count_chunks(self, document_id: int) -> int: ...
+
     async def insert_chunks(self, chunks: list[ChunkRecord]) -> list[int]:
         """Insert chunks and return their assigned ids."""
         ...
@@ -400,6 +402,17 @@ class SQLiteBackend:
             conn.close()
 
         await self._run(_delete)
+
+    async def count_chunks(self, document_id: int) -> int:
+        def _count():
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)
+            ).fetchone()
+            conn.close()
+            return row[0]
+
+        return await self._run(_count)
 
     async def insert_chunks(self, chunks: list[ChunkRecord]) -> list[int]:
         def _insert():

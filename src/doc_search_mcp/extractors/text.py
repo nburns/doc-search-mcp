@@ -14,6 +14,8 @@ class RawChunk:
 
 def extract_text(path: Path) -> list[RawChunk]:
     content = path.read_text(encoding="utf-8", errors="replace")
+    if not content.strip():
+        raise ValueError(f"{path.name} is empty")
     if path.suffix.lower() == ".md":
         return _split_markdown(content)
     return _split_plain(content)

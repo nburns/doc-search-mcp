@@ -95,8 +95,11 @@ async def _extract_one(
             existing_by_checksum = await backend.get_document_by_checksum(checksum, category)
             if existing_by_checksum:
                 await backend.add_path(existing_by_checksum.id, str(path))
-                job.completed_files += 1
-                return
+                if await backend.count_chunks(existing_by_checksum.id) > 0:
+                    job.completed_files += 1
+                    return
+                # Document record exists but has no chunks - previous job was interrupted
+                # mid-write. Fall through to re-extract.
 
             # Check if this path was previously indexed with different content
             existing_by_path = await backend.get_document_by_path(str(path), category)
@@ -107,9 +110,16 @@ async def _extract_one(
                 await backend.clear_warnings_for_document(existing_by_path.id)
 
             loop = asyncio.get_event_loop()
-            raw_chunks, structure_source = await loop.run_in_executor(
-                None, lambda: _extract_sync(path, config)
-            )
+            try:
+                raw_chunks, structure_source = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: _extract_sync(path, config)),
+                    timeout=config.performance.extraction_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"Extraction timed out after {config.performance.extraction_timeout}s"
+                    " - file may be corrupt or require more time (increase performance.extraction_timeout)"
+                )
 
             title = path.stem.replace("-", " ").replace("_", " ").title()
             doc = DocumentRecord(
